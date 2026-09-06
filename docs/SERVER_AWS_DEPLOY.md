@@ -62,8 +62,69 @@ workflow one of two ways:
 In both cases a version containing `-` (e.g. `v1.2.3-rc.1`) is treated as a
 pre-release and does not move the `latest` tag.
 
-The AWS deploy below still builds and pushes to ECR via `scripts/aws-deploy.sh`;
-consuming the published GHCR image from the deploy flow is a separate, later change.
+Published images are what the **AWS Deploy** workflow rolls out (next section).
+`scripts/aws-deploy.sh` still builds and pushes its own image for infrastructure
+changes and first-time stack setup.
+
+## Deploying a published image from GitHub Actions
+
+The **AWS Deploy** workflow (`.github/workflows/aws-deploy.yml`) deploys a
+published GHCR version to the `stg` or `prod` stack without local AWS
+credentials or Terraform state. Run it from the Actions tab with:
+
+- `environment`: `stg` or `prod`
+- `version`: a published tag such as `v1.2.3`. `stg` also accepts pre-releases
+  like `v1.2.3-rc.1`; `prod` refuses them.
+
+What a run does:
+
+1. Resolves the version tag to an immutable digest and verifies that digest
+   against the SLSA provenance attestation signed by the Docker Publish
+   workflow. For `prod` the attestation must also show the build ran from the
+   `refs/tags/<version>` release tag, so a manually dispatched build of another
+   branch cannot ship to prod under a release version. This happens before the
+   environment's protection rules, so `prod` reviewers are only asked to approve
+   an already-verified digest.
+2. Authenticates to AWS with GitHub OIDC (bootstrap role, then role chaining to
+   the deploy role) and checks the stack's ECR repository and ECS service exist.
+3. Mirrors the verified digest into `<stack>-server` in ECR, tagged both
+   `<version>` and `latest`. Moving `latest` keeps
+   `scripts/aws-deploy.sh plan` / `deploy --skip-build` resolving the deployed
+   image, so a later Terraform apply does not roll the service back.
+4. Registers a new revision of the task definition the service is currently
+   running, with only the image changed, and waits up to 20 minutes for the
+   rollout to stabilize.
+
+The run summary records the deployed image URI and the previous task-definition
+ARN. There is no automatic rollback: if a rollout fails, the summary prints the
+`aws ecs update-service` command to restore the previous revision, or re-run the
+workflow with the previously deployed version.
+
+The workflow only rolls out an image. When a release also changes the task
+definition (new environment variables, secrets, or IAM grants in `infra/`),
+apply that release's Terraform first with `scripts/aws-deploy.sh`, then deploy
+the image. Stacks that override the default `<stack>-server` / `<stack>-cluster`
+resource names in Terraform (or `ECR_REPO_NAME` in the script) are not
+supported by the workflow. The `guardian-evm` stack is also out of scope: GHCR
+release images are built with the `postgres` feature only.
+
+One-time setup per target (infra):
+
+- A GitHub environment named `stg` / `prod` with variables `AWS_REGION`,
+  `ROLE_FOR_OIDC` (role trusted for GitHub OIDC), `ROLE_TO_ASSUME` (deploy role
+  reached via role chaining), and `STACK_NAME` (`guardian` / `guardian-prod`).
+  Add required reviewers on `prod`.
+- The OIDC role's trust policy must accept this repository's environment
+  subject claims (`repo:OpenZeppelin/guardian:environment:stg` / `:prod`).
+- The deploy role needs ECR push/pull on `<stack>-server`
+  (`ecr:GetAuthorizationToken`, `ecr:DescribeRepositories`,
+  `ecr:BatchCheckLayerAvailability`, `ecr:BatchGetImage`,
+  `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`,
+  `ecr:PutImage`), `ecs:DescribeServices`, `ecs:DescribeTaskDefinition`,
+  `ecs:RegisterTaskDefinition`, `ecs:UpdateService`, and `iam:PassRole` on the
+  stack's task and task-execution roles.
+- The ECR repository must already exist; `scripts/aws-deploy.sh build` creates
+  it on a new stack.
 
 ## Prerequisites
 

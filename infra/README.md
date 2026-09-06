@@ -137,6 +137,12 @@ terraform plan
 terraform apply
 ```
 
+Image-only rollouts of a published GHCR version go through the **AWS Deploy**
+GitHub Actions workflow instead (OIDC, no local credentials or state). It also
+moves the ECR `latest` tag so the `server_image_uri` resolved by
+`scripts/aws-deploy.sh` stays in step with what is running. See
+[`docs/SERVER_AWS_DEPLOY.md`](../docs/SERVER_AWS_DEPLOY.md#deploying-a-published-image-from-github-actions).
+
 For direct prod Terraform usage, create the dashboard cursor secret before
 planning. Its value must be exactly 64 hexadecimal characters. Terraform checks
 that the secret exists without reading its value into state; the deployment

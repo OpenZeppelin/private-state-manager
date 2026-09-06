@@ -1,0 +1,259 @@
+---
+name: AWS Deploy
+
+# Deploys an already-published ghcr.io/openzeppelin/guardian release image to an
+# AWS ECS stack. The `validate` job resolves the version tag to an immutable
+# digest and verifies that digest against the SLSA provenance attestation signed
+# by docker-publish.yml (prod additionally requires the build to have run from
+# the release tag). The `deploy` job then mirrors that exact digest into the
+# stack's ECR repository (also moving the `latest` tag, which scripts/aws-deploy.sh
+# resolves), registers a new revision of the task definition the service is
+# currently running with the new image, and waits for the rollout. AWS access
+# uses GitHub OIDC with role chaining only; no long-lived keys.
+#
+# Each GitHub environment (stg, prod) must define these variables:
+#   AWS_REGION      - AWS region of the stack (e.g. us-east-1)
+#   ROLE_FOR_OIDC   - IAM role ARN trusted for GitHub OIDC (bootstrap role)
+#   ROLE_TO_ASSUME  - IAM deploy role ARN assumed via role chaining
+#   STACK_NAME      - Terraform stack_name (guardian for stg, guardian-prod for prod)
+#
+# Resource names assume the infra/data.tf defaults derived from stack_name:
+# ECR repository, ECS service, task family, and container `<stack>-server`, ECS
+# cluster `<stack>-cluster`. Stacks that override those Terraform variables (or
+# ECR_REPO_NAME in scripts/aws-deploy.sh) are not supported by this workflow.
+#
+# This workflow only rolls out a new image. Infrastructure changes still go
+# through Terraform (scripts/aws-deploy.sh); when a release also changes the
+# task definition (new env vars, secrets, IAM grants), apply that release's
+# infra/ first, then deploy the image here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        required: true
+        options:
+          - stg
+          - prod
+      version:
+        description: "Published image version to deploy, e.g. v1.2.3 (stg also accepts pre-releases like v1.2.3-rc.1)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aws-deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  GHCR_IMAGE: ghcr.io/openzeppelin/guardian
+  TARGET_ENV: ${{ inputs.environment }}
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  # Runs before the target environment's protection rules so an invalid or
+  # unverifiable version is rejected without paging prod reviewers, and so
+  # reviewers approve an already-verified digest.
+  validate:
+    name: Validate ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'OpenZeppelin'
+    outputs:
+      digest: ${{ steps.source.outputs.digest }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Validate version
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version '$VERSION'. Expected a tag like v1.2.3 or a pre-release like v1.2.3-rc.1."
+            exit 1
+          fi
+          if [[ "$TARGET_ENV" == "prod" && "$VERSION" == *-* ]]; then
+            echo "::error::Refusing to deploy pre-release '$VERSION' to prod. Deploy a full release like v1.2.3."
+            exit 1
+          fi
+
+      - name: Resolve source image digest
+        id: source
+        run: |
+          digest=$(docker buildx imagetools inspect "${GHCR_IMAGE}:${VERSION}" --format '{{.Manifest.Digest}}')
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not resolve digest for ${GHCR_IMAGE}:${VERSION}"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Source image: ${GHCR_IMAGE}:${VERSION}@${digest}"
+
+      # Verifies the resolved digest, not the mutable tag, so the image that is
+      # mirrored and deployed is exactly the one that passed verification.
+      - name: Verify build provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_DIGEST: ${{ steps.source.outputs.digest }}
+        run: |
+          verify_args=(
+            --repo "$SOURCE_REPO"
+            --predicate-type https://slsa.dev/provenance/v1
+            --signer-workflow "${SOURCE_REPO}/.github/workflows/docker-publish.yml"
+          )
+          if [[ "$TARGET_ENV" == "prod" ]]; then
+            verify_args+=(--source-ref "refs/tags/${VERSION}")
+          fi
+          gh attestation verify "oci://${GHCR_IMAGE}@${SOURCE_DIGEST}" "${verify_args[@]}"
+
+  deploy:
+    name: Deploy ${{ inputs.version }} to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SOURCE_DIGEST: ${{ needs.validate.outputs.digest }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STACK_NAME: ${{ vars.STACK_NAME }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Validate environment configuration
+        env:
+          ROLE_FOR_OIDC: ${{ vars.ROLE_FOR_OIDC }}
+          ROLE_TO_ASSUME: ${{ vars.ROLE_TO_ASSUME }}
+        run: |
+          missing=""
+          for var_name in AWS_REGION STACK_NAME ROLE_FOR_OIDC ROLE_TO_ASSUME; do
+            if [[ -z "${!var_name}" ]]; then
+              missing="${missing} ${var_name}"
+            fi
+          done
+          if [[ -n "$missing" ]]; then
+            echo "::error::GitHub environment '$TARGET_ENV' is missing required variable(s):${missing}"
+            exit 1
+          fi
+
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ vars.ROLE_FOR_OIDC }}
+          role-session-name: guardian-aws-deploy
+          role-duration-seconds: 900
+
+      # Role chaining caps the session at 1 hour and it cannot be refreshed, so
+      # the mirror, deploy, and stability wait below must all finish within it.
+      - name: Assume deploy role
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          aws-region: ${{ vars.AWS_REGION }}
+          role-chaining: true
+          role-to-assume: ${{ vars.ROLE_TO_ASSUME }}
+          role-session-name: guardian-aws-deploy
+          role-duration-seconds: 3600
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Check stack resources and record current task definition
+        id: service
+        run: |
+          if ! aws ecr describe-repositories --repository-names "${STACK_NAME}-server" >/dev/null; then
+            echo "::error::ECR repository ${STACK_NAME}-server not found in ${AWS_REGION}. Create it with 'scripts/aws-deploy.sh build' before the first workflow deploy."
+            exit 1
+          fi
+          read -r status task_definition < <(aws ecs describe-services \
+            --cluster "${STACK_NAME}-cluster" \
+            --services "${STACK_NAME}-server" \
+            --query 'services[0].[status,taskDefinition]' \
+            --output text)
+          if [[ "$status" != "ACTIVE" ]]; then
+            echo "::error::ECS service ${STACK_NAME}-server in cluster ${STACK_NAME}-cluster is not ACTIVE (got '${status}')"
+            exit 1
+          fi
+          echo "previous_task_definition=${task_definition}" >> "$GITHUB_OUTPUT"
+          echo "Service is running ${task_definition}"
+
+      # The `latest` tag is moved too because scripts/aws-deploy.sh resolves it
+      # for `plan` and `deploy --skip-build`; leaving it behind would make the
+      # next Terraform apply roll the service back to the previously built image.
+      - name: Mirror image to ECR
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          ecr_repo="${ECR_REGISTRY}/${STACK_NAME}-server"
+          docker buildx imagetools create \
+            --tag "${ecr_repo}:${VERSION}" \
+            --tag "${ecr_repo}:latest" \
+            "${GHCR_IMAGE}@${SOURCE_DIGEST}"
+          mirrored_digest=$(docker buildx imagetools inspect "${ecr_repo}:${VERSION}" --format '{{.Manifest.Digest}}')
+          if [[ "$mirrored_digest" != "$SOURCE_DIGEST" ]]; then
+            echo "::error::Mirrored digest ${mirrored_digest} does not match verified source digest ${SOURCE_DIGEST}. The source must be a single OCI image index for the manifest to pass through unchanged."
+            exit 1
+          fi
+          echo "image_uri=${ecr_repo}@${SOURCE_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Render task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@138c24f321fdbdf7edee4a685519d253cae2cdea # v1.9.0
+        with:
+          task-definition-arn: ${{ steps.service.outputs.previous_task_definition }}
+          container-name: ${{ vars.STACK_NAME }}-server
+          image: ${{ steps.image.outputs.image_uri }}
+
+      - name: Deploy to ECS and wait for stability
+        uses: aws-actions/amazon-ecs-deploy-task-definition@c465972ecbd160473f22e683363b422a5412a3de # v2.6.3
+        with:
+          cluster: ${{ vars.STACK_NAME }}-cluster
+          service: ${{ vars.STACK_NAME }}-server
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          wait-for-service-stability: true
+          wait-for-minutes: 20
+
+      - name: Deploy summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+          PREVIOUS_TASK_DEFINITION: ${{ steps.service.outputs.previous_task_definition }}
+        run: |
+          {
+            if [[ "$JOB_STATUS" == "success" ]]; then
+              echo "### Deployed \`${VERSION}\` to \`${TARGET_ENV}\`"
+              echo
+              echo "**Image:** \`${IMAGE_URI}\`"
+              echo
+              echo "**Source:** \`${GHCR_IMAGE}@${SOURCE_DIGEST}\` (provenance verified)"
+              echo
+              echo "**Previous task definition:** \`${PREVIOUS_TASK_DEFINITION}\`"
+              echo
+              echo "ECR \`${STACK_NAME}-server:latest\` now points at this image, so \`scripts/aws-deploy.sh plan\` / \`deploy --skip-build\` will keep it on the next Terraform apply."
+            else
+              echo "### Deploy of \`${VERSION}\` to \`${TARGET_ENV}\` did not succeed (\`${JOB_STATUS}\`)"
+              echo
+              if [[ -n "$PREVIOUS_TASK_DEFINITION" ]]; then
+                echo "The service has no automatic rollback. If a new task definition was registered, check the service and roll back if needed:"
+                echo
+                echo '```'
+                echo "aws ecs update-service --cluster ${STACK_NAME}-cluster --service ${STACK_NAME}-server --task-definition ${PREVIOUS_TASK_DEFINITION}"
+                echo '```'
+                echo
+                echo "Alternatively re-run this workflow with the previously deployed version."
+              else
+                echo "The run failed before reaching the ECS service, so nothing was changed."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
