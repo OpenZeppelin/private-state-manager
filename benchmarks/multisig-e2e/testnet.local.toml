@@ -1,0 +1,12 @@
+accounts_file = ".guardian/bench/multisig-e2e-accounts.json"
+faucet_id = "mtst1aqj93e2yvy5wdv2skadca0vuuypfnp80"
+operations = 50
+amount = 1
+consume_probability = 0.5
+seed = 42
+poll_interval_ms = 1000
+timeout_seconds = 180
+proposal_retry_interval_ms = 1000
+proposal_retry_timeout_seconds = 180
+max_duration_seconds = 1800
+artifacts_dir = "benchmarks/multisig-e2e/reports"

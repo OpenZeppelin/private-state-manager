@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "benchmarks/multisig-e2e",
     "benchmarks/prod-server",
     "crates/shared",
     "crates/client",

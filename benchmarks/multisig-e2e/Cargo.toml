@@ -1,0 +1,21 @@
+[package]
+name = "guardian-multisig-e2e-benchmark"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+guardian-client = { path = "../../crates/client" }
+hex = { workspace = true }
+miden-multisig-client = { path = "../../crates/miden-multisig-client" }
+miden-protocol = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
