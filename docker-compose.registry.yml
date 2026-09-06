@@ -34,7 +34,7 @@ services:
       - DATABASE_URL=postgres://guardian:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.registry}@postgres:5432/guardian
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     volumes:
       - guardian-postgres:/var/lib/postgresql/data
     environment:
